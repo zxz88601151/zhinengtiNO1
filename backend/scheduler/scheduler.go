@@ -6,14 +6,20 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
 	"wah/backend/eventbus"
 	"wah/backend/store"
 	"wah/core/clock"
+	"wah/core/cron"
 	"wah/core/id"
 )
+
+// V0 seeds Asia/Shanghai only. A fixed +08 avoids a tzdata dependency on
+// Windows; DST has not applied there since 1991.
+var shanghai = time.FixedZone("CST", 8*3600)
 
 // V0: skip_missed only. Does not interpret budget_blocked / catch-up completion (Q3/Q5/Q6 UNSET).
 type Service struct {
@@ -42,16 +48,16 @@ func (s *Service) Start() {
 
 func (s *Service) Tick(ctx context.Context) error {
 	now := time.Now().UTC()
-	rows, err := s.Store.Query(ctx, `SELECT id, current_version_id, schedule_cron, next_fire_at FROM workflow WHERE schedule_enabled=1`)
+	rows, err := s.Store.Query(ctx, `SELECT id, current_version_id, schedule_cron, schedule_timezone, next_fire_at FROM workflow WHERE schedule_enabled=1`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	type wf struct{ id, ver, cron, next sql.NullString }
+	type wf struct{ id, ver, cronExpr, tz, next sql.NullString }
 	var list []wf
 	for rows.Next() {
 		var w wf
-		if err := rows.Scan(&w.id, &w.ver, &w.cron, &w.next); err != nil {
+		if err := rows.Scan(&w.id, &w.ver, &w.cronExpr, &w.tz, &w.next); err != nil {
 			return err
 		}
 		list = append(list, w)
@@ -61,6 +67,12 @@ func (s *Service) Tick(ctx context.Context) error {
 		if !w.ver.Valid {
 			continue
 		}
+		// A timezone V0 cannot honour is left untouched rather than silently
+		// computed in the wrong zone.
+		if !w.tz.Valid || w.tz.String != "Asia/Shanghai" {
+			log.Printf("scheduler: unsupported timezone %q on workflow %s; skipped", w.tz.String, w.id.String)
+			continue
+		}
 		nextT, err := time.Parse(time.RFC3339, w.next.String)
 		if err != nil {
 			continue
@@ -68,15 +80,23 @@ func (s *Service) Tick(ctx context.Context) error {
 		if nextT.After(now) {
 			continue
 		}
-		// missed window: persist skipped_missed, advance cursor by +24h placeholder. Not catch-up.
-		if err := s.skipMissed(ctx, w.id.String, w.ver.String, nextT); err != nil {
+		// missed window: persist skipped_missed and advance the cursor to the
+		// next real cron fire. Not catch-up, and no Task is derived here.
+		if err := s.skipMissed(ctx, w.id.String, w.ver.String, w.cronExpr.String, nextT); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Service) skipMissed(ctx context.Context, workflowID, versionID string, fireAt time.Time) error {
+func (s *Service) skipMissed(ctx context.Context, workflowID, versionID, cronExpr string, fireAt time.Time) error {
+	// Resolve the next fire before opening the transaction: a bad expression
+	// must not leave half a schedule_run behind, and must not move the cursor.
+	nextFire, nextErr := cron.NextAfter(cronExpr, fireAt, shanghai)
+	if nextErr != nil {
+		return fmt.Errorf("advance workflow %s: %w", workflowID, nextErr)
+	}
+	next := nextFire.UTC().Format(time.RFC3339)
 	dedupe := hashKey(workflowID + "|" + fireAt.UTC().Format(time.RFC3339) + "|workflow")
 	snap, _ := json.Marshal(map[string]any{"catchup_mode": "skip_missed", "note": "Q3/Q5/Q6 unset"})
 	sum := sha256.Sum256(snap)
@@ -106,7 +126,6 @@ func (s *Service) skipMissed(ctx context.Context, workflowID, versionID string, 
 			VALUES(?,?,?,?,?,?,?,?,?)`, id.New(), runID, dedupe, fireAt.UTC().Format(time.RFC3339), "skipped_missed", "CATCHUP_UNSET", s.Actor, now, `{"policy":"skip_missed"}`); err != nil {
 			return err
 		}
-		next := fireAt.Add(24 * time.Hour).UTC().Format(time.RFC3339)
 		_, err = tx.Exec(`UPDATE workflow SET next_fire_at=?, updated_at=? WHERE id=?`, next, now, workflowID)
 		return err
 	})
@@ -114,11 +133,17 @@ func (s *Service) skipMissed(ctx context.Context, workflowID, versionID string, 
 
 func (s *Service) Arrange(ctx context.Context, title, cronExpr string) (string, error) {
 	now := clock.Now()
+	// Validate before writing: an unusable expression must not produce an
+	// "arranged" workflow carrying a fabricated next_fire_at.
+	nextFire, err := cron.NextAfter(cronExpr, time.Now().UTC(), shanghai)
+	if err != nil {
+		return "", fmt.Errorf("invalid schedule cron %q: %w", cronExpr, err)
+	}
+	next := nextFire.UTC().Format(time.RFC3339)
 	wf := id.New()
 	ver := id.New()
-	next := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
 	plan, _ := json.Marshal(map[string]any{"title": title, "cron": cronExpr})
-	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+	err = s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`INSERT INTO workflow(id,name,current_version_id,schedule_cron,schedule_timezone,schedule_enabled,next_fire_at,created_at,updated_at)
 			VALUES(?,?,?,?,?,?,?,?,?)`, wf, title, ver, cronExpr, "Asia/Shanghai", 1, next, now, now); err != nil {
 			return err
