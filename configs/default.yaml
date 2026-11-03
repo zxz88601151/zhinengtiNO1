@@ -19,6 +19,9 @@ scheduler:
 ui:
   hybrid: conversation-left-execution-right
   effects: session+task+notice
+  # Documented V0 default only. The server reads WAH_L3_CONFIRM_PHRASE and
+  # exposes the effective value via /v1/health; this file is not parsed at runtime.
+  l3_confirm_phrase: 确认提交
 
 task_policy:
   interrupted_timeout: UNSET

@@ -38,7 +38,11 @@ func main() {
 
 	bus := eventbus.New()
 	sched := &scheduler.Service{Store: st, Bus: bus, Actor: "scheduler:v0", StopCh: make(chan struct{})}
-	hub := &orchestrator.Hub{Store: st, Bus: bus, Arranger: sched}
+	hub := &orchestrator.Hub{
+		Store: st, Bus: bus, Arranger: sched,
+		NoteDir:         filepath.Join(root, "data", "notes"),
+		L3ConfirmPhrase: env("WAH_L3_CONFIRM_PHRASE", "确认提交"),
+	}
 	auth := &authn.Service{Secret: []byte(env("WAH_JWT_SECRET", "wah-local-dev-secret"))}
 	srv := &api.Server{Hub: hub, Auth: auth, Bus: bus}
 

@@ -28,6 +28,7 @@ func (s *Server) Routes() http.Handler {
 	r.Post("/v1/intent", s.intent)
 	r.Get("/v1/tasks", s.tasks)
 	r.Get("/v1/tasks/{id}", s.task)
+	r.Get("/v1/tasks/{id}/detail", s.taskDetail)
 	r.Post("/v1/tasks/{id}/control", s.control)
 	r.Get("/v1/approvals", s.approvals)
 	r.Post("/v1/approvals/{id}/decision", s.decide)
@@ -84,6 +85,15 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, view)
+}
+
+func (s *Server) taskDetail(w http.ResponseWriter, r *http.Request) {
+	d, err := s.Hub.Detail(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, 404, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, d)
 }
 
 func (s *Server) control(w http.ResponseWriter, r *http.Request) {
