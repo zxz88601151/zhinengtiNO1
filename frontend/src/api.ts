@@ -8,13 +8,45 @@ export type TaskView = {
   plan: unknown;
   createdAt: string;
   updatedAt: string;
+  path?: string[];
+};
+
+export type StepEvidence = {
+  stepNo: number;
+  revisionNo: number;
+  tool: string;
+  evidenceKind: string;
+  executionOutcome: string;
+  sideEffectStatus: string;
+  uncertaintyStatus: string;
+  resultRef?: string;
+  intentEventId: string;
+  intentAt: string;
+  resultEventId?: string;
+  resultAt?: string;
+  startedAt?: string;
+  endedAt?: string;
+};
+
+export type TaskDetail = TaskView & {
+  states: string[];
+  steps: StepEvidence[];
+};
+
+export type PlanStep = {
+  no: number;
+  tool: string;
+  action: string;
+  level: string;
+  payload?: unknown;
 };
 
 export type Approval = {
   id: string;
   taskId: string;
   level: string;
-  scope: { title?: string; summary?: string; confirmLevel?: string; steps?: unknown[] };
+  round: number;
+  scope: { title?: string; summary?: string; confirmLevel?: string; steps?: PlanStep[] };
   expiresAt: string;
 };
 
@@ -29,7 +61,20 @@ export type AuditEvent = {
   at: string;
 };
 
+export type Health = {
+  ok: boolean;
+  writer?: string;
+  tools?: number;
+  budget?: string;
+  schedulerSemantics?: string;
+  l3ConfirmPhrase?: string;
+};
+
 let token = "";
+// The typed L3 re-confirmation phrase lives on the server (WAH_L3_CONFIRM_PHRASE).
+// It stays empty until /v1/health answers; no approval card renders before boot,
+// so the client never needs its own copy of the default wording.
+let l3Phrase = "";
 
 export async function boot() {
   const r = await fetch(`${BASE}/v1/auth/local`, { method: "POST" });
@@ -41,9 +86,19 @@ function headers() {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 }
 
-export async function health() {
+export async function health(): Promise<Health> {
   const r = await fetch(`${BASE}/v1/health`);
-  return r.json();
+  const j = (await r.json()) as Health;
+  if (typeof j.l3ConfirmPhrase === "string" && j.l3ConfirmPhrase) {
+    l3Phrase = j.l3ConfirmPhrase;
+  }
+  return j;
+}
+
+// Read at click time, not captured at module load, so a reconfigured server is
+// honoured without duplicating the phrase in the UI.
+export function l3ConfirmPhrase(): string {
+  return l3Phrase;
 }
 
 export async function sendIntent(text: string, source: "voice" | "manual") {
@@ -61,6 +116,13 @@ export async function listTasks() {
   const r = await fetch(`${BASE}/v1/tasks`, { headers: headers() });
   const j = await r.json();
   return (j.tasks || []) as TaskView[];
+}
+
+export async function getTaskDetail(id: string) {
+  const r = await fetch(`${BASE}/v1/tasks/${id}/detail`, { headers: headers() });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "detail failed");
+  return j as TaskDetail;
 }
 
 export async function listApprovals() {
