@@ -26,6 +26,13 @@ var terminals = map[Status]bool{
 
 func IsTerminal(s Status) bool { return terminals[s] }
 
+// Sequence is the Rev.4.1 §7 presentation order: pipeline states first, the six
+// terminals last. The UI renders this list rather than keeping its own copy.
+func Sequence() []Status {
+	return []Status{Created, Planning, Validating, WaitingApproval, Ready, Running, Interrupted,
+		Expired, Succeeded, Failed, Partial, Unknown, Cancelled}
+}
+
 // allowed edges from Rev.4.1 §7 (including △ conditions, enforced by caller).
 var allowed = map[Status]map[Status]bool{
 	Created:         {Planning: true, Cancelled: true},
