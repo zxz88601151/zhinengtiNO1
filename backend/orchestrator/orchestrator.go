@@ -7,12 +7,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"wah/backend/eventbus"
 	"wah/backend/store"
 	"wah/core/clock"
+	"wah/core/cron"
 	"wah/core/id"
 	"wah/core/taskfsm"
 )
@@ -25,6 +30,22 @@ type Hub struct {
 	Store    *store.Store
 	Bus      *eventbus.Bus
 	Arranger Arranger
+	// NoteDir is where note.local really writes. Unset means note.local cannot
+	// run at all — the step is reported unconfirmed rather than faked.
+	NoteDir string
+	// L3ConfirmPhrase is the single source for the typed re-confirmation. The UI
+	// reads it from /v1/health so the phrase cannot drift between client and
+	// server; an unset value keeps the V0 default.
+	L3ConfirmPhrase string
+}
+
+const defaultL3Phrase = "确认提交"
+
+func (h *Hub) l3Phrase() string {
+	if h.L3ConfirmPhrase == "" {
+		return defaultL3Phrase
+	}
+	return h.L3ConfirmPhrase
 }
 
 type Intent struct {
@@ -58,6 +79,7 @@ type TaskView struct {
 	Plan      json.RawMessage `json:"plan"`
 	UpdatedAt string          `json:"updatedAt"`
 	CreatedAt string          `json:"createdAt"`
+	Path      []string        `json:"path,omitempty"`
 }
 
 func (h *Hub) SubmitIntent(ctx context.Context, in Intent) (*TaskView, string, error) {
@@ -114,7 +136,14 @@ func (h *Hub) SubmitIntent(ctx context.Context, in Intent) (*TaskView, string, e
 	if err := h.requestApproval(ctx, taskID, plan); err != nil {
 		return nil, "", err
 	}
-	reply = "需要你确认后我才会执行：" + plan.Summary
+	switch plan.ConfirmLevel {
+	case "L3":
+		reply = "这是高风险操作，需要你输入式复述「" + h.l3Phrase() + "」确认：" + plan.Summary
+	case "L2":
+		reply = "这是对外类操作，需要你确认两次：" + plan.Summary
+	default:
+		reply = "需要你确认后我才会执行：" + plan.Summary
+	}
 	view, err := h.GetTask(ctx, taskID)
 	return view, reply, err
 }
@@ -131,7 +160,10 @@ func (h *Hub) requestApproval(ctx context.Context, taskID string, plan Plan) err
 		if err := tx.QueryRow(`SELECT id FROM permission_grant WHERE tool_id=? AND revoked_at IS NULL LIMIT 1`, toolID).Scan(&grantID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT INTO task_grant_binding(task_id,grant_id,tool_id,bound_at) VALUES(?,?,?,?)`,
+		// Re-confirming the same task re-binds the same grant: the binding is a link,
+		// so a duplicate is a no-op rather than a conflict.
+		if _, err := tx.Exec(`INSERT INTO task_grant_binding(task_id,grant_id,tool_id,bound_at) VALUES(?,?,?,?)
+			ON CONFLICT(task_id,grant_id) DO NOTHING`,
 			taskID, grantID, toolID, now); err != nil {
 			return err
 		}
@@ -144,16 +176,24 @@ func (h *Hub) requestApproval(ctx context.Context, taskID string, plan Plan) err
 			string(scope), `{"allow":["planned"]}`, `{"workspace":"local"}`, exp, now); err != nil {
 			return err
 		}
+		// Which confirmation round this card is: counted from the decisions already
+		// recorded for this task, so the audit trail itself is the source.
+		var approved int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM approval_decision d JOIN approval_request r ON r.id=d.request_id
+			WHERE r.task_id=? AND d.decision='approve'`, taskID).Scan(&approved); err != nil {
+			return err
+		}
+		round := approved + 1
 		if err := transition(tx, taskID, taskfsm.Validating, taskfsm.WaitingApproval); err != nil {
 			return err
 		}
 		if err := appendEvent(tx, taskID, nextSeq(tx, taskID), "approval_requested", string(taskfsm.Validating), string(taskfsm.WaitingApproval), map[string]any{
-			"requestId": reqID, "level": plan.ConfirmLevel,
+			"requestId": reqID, "level": plan.ConfirmLevel, "round": round,
 		}); err != nil {
 			return err
 		}
 		h.Bus.Publish(eventbus.Event{Type: "approval_requested", TaskID: taskID, Payload: eventbus.JSON(map[string]any{
-			"requestId": reqID, "level": plan.ConfirmLevel, "title": plan.Title, "summary": plan.Summary, "plan": plan,
+			"requestId": reqID, "level": plan.ConfirmLevel, "round": round, "title": plan.Title, "summary": plan.Summary, "plan": plan,
 		})})
 		return nil
 	})
@@ -212,9 +252,38 @@ func (h *Hub) Decide(ctx context.Context, requestID, decision, actor, reason str
 		if err != nil {
 			return err
 		}
+		if plan.ConfirmLevel == "L2" {
+			// VoiceFirst §I: L2 = 强制卡片确认 + 关键信息高亮 + 二次确认. The second
+			// confirmation gets its own ApprovalRequest so it leaves its own
+			// ApprovalDecision row — approval_decision.request_id is UNIQUE.
+			n, err := h.approvedCount(ctx, taskID)
+			if err != nil {
+				return err
+			}
+			if n < 2 {
+				return h.reconfirm(ctx, taskID, plan)
+			}
+		}
 		return h.bindAndRun(ctx, taskID, plan, false)
 	}
 	return nil
+}
+
+// reconfirm routes READY back through VALIDATING because the 13-state matrix has no
+// READY → WAITING_APPROVAL edge; the re-validation hop is itself event-recorded.
+func (h *Hub) reconfirm(ctx context.Context, taskID string, plan Plan) error {
+	if err := h.advance(ctx, taskID, taskfsm.Ready, taskfsm.Validating, "revalidation_started"); err != nil {
+		return err
+	}
+	return h.requestApproval(ctx, taskID, plan)
+}
+
+func (h *Hub) approvedCount(ctx context.Context, taskID string) (int, error) {
+	var n int
+	err := h.Store.QueryRow(ctx, `SELECT COUNT(*) FROM approval_decision d
+		JOIN approval_request r ON r.id = d.request_id
+		WHERE r.task_id=? AND d.decision='approve'`, taskID).Scan(&n)
+	return n, err
 }
 
 func (h *Hub) Control(ctx context.Context, taskID, action string) error {
@@ -278,8 +347,8 @@ func (h *Hub) bindAndRun(ctx context.Context, taskID string, plan Plan, alreadyR
 		return err
 	}
 
-	// T4 remote window: local mock tools (no Playwright in V0)
-	results := executePlan(plan)
+	// T4 remote window: local tools run for real; simulated ones say so.
+	results := h.executePlan(ctx, taskID, plan)
 
 	err = h.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		end := clock.Now()
@@ -298,11 +367,8 @@ func (h *Hub) bindAndRun(ctx context.Context, taskID string, plan Plan, alreadyR
 			}
 			outcome := "succeeded"
 			evidence := "success"
-			side := "present_confirmed"
+			side := results[i].SideEffect
 			uncert := "none"
-			if step.Tool == "answer.query" {
-				side = "absent_confirmed"
-			}
 			if !ok {
 				// tool error without side-effect confirmation → UNKNOWN, not FAILED
 				outcome = "unknown"
@@ -341,11 +407,6 @@ func (h *Hub) bindAndRun(ctx context.Context, taskID string, plan Plan, alreadyR
 	if err != nil {
 		return err
 	}
-	if plan.Kind == "schedule" && h.Arranger != nil {
-		if _, err := h.Arranger.Arrange(ctx, plan.Title, "0 8 * * *"); err != nil {
-			return err
-		}
-	}
 	h.emitTask(taskID, "task_transition", map[string]any{"status": statusOf(ctx, h, taskID), "kind": plan.Kind})
 	return nil
 }
@@ -354,15 +415,92 @@ type stepResult struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
 	Ref     string `json:"ref"`
+	// SideEffect is what this run actually established, and it is the only
+	// source for task_step_result.side_effect_status: a simulated step can
+	// therefore never be recorded as present_confirmed.
+	SideEffect string `json:"sideEffect"`
 }
 
-func executePlan(plan Plan) []stepResult {
+// simCron is the V0 fallback when the utterance names no clock time. It is an
+// implementation default, not an owner-ratified schedule value.
+const simCron = "0 8 * * *"
+
+func (h *Hub) runStep(ctx context.Context, taskID string, plan Plan, s PlanStep) stepResult {
+	switch s.Tool {
+	case "note.local":
+		ref, err := h.writeNote(taskID, s)
+		if err != nil {
+			return stepResult{Message: "笔记落盘未完成：" + err.Error(), SideEffect: "possible_unconfirmed"}
+		}
+		return stepResult{OK: true, Message: "笔记已落盘并回读一致：" + ref, Ref: ref, SideEffect: "present_confirmed"}
+	case "schedule.create":
+		if h.Arranger == nil {
+			return stepResult{Message: "调度器未接线，预约未创建", SideEffect: "possible_unconfirmed"}
+		}
+		expr := plan.CronHint
+		origin := "按口述解析"
+		if expr == "" {
+			expr = simCron
+			origin = "口述未识别具体时间，按 V0 默认"
+		}
+		wfID, err := h.Arranger.Arrange(ctx, plan.Title, expr)
+		if err != nil {
+			return stepResult{Message: "预约创建失败：" + err.Error(), SideEffect: "possible_unconfirmed"}
+		}
+		// The workflow row is the side effect; confirm it exists before claiming so.
+		var found string
+		if err := h.Store.QueryRow(ctx, `SELECT id FROM workflow WHERE id=?`, wfID).Scan(&found); err != nil {
+			return stepResult{Message: "预约行回读失败，状态未知", Ref: "workflow:" + wfID, SideEffect: "possible_unconfirmed"}
+		}
+		return stepResult{OK: true, Message: "预约已创建并回读到 workflow 行（cron " + expr + "，" + origin + "，语义仍为 arranged-only）",
+			Ref: "workflow:" + found, SideEffect: "present_confirmed"}
+	case "answer.query":
+		return stepResult{OK: true, Message: mockAnswer(payloadText(s)), Ref: "sim:answer.query", SideEffect: "absent_confirmed"}
+	default:
+		// form.preview / form.submit: no browser is wired in V0, so the honest
+		// record is "no page or outward effect happened".
+		return stepResult{OK: true, Message: "V0 未连接真实页面：仅记录计划步骤「" + s.Action + "」，无页面或对外副作用",
+			Ref: "sim:" + s.Tool, SideEffect: "absent_confirmed"}
+	}
+}
+
+// writeNote is the one V0 tool with a durable local effect. The evidence is only
+// presented as confirmed after the bytes are read back from disk.
+func (h *Hub) writeNote(taskID string, s PlanStep) (string, error) {
+	if h.NoteDir == "" {
+		return "", fmt.Errorf("note.local 未配置落盘目录")
+	}
+	// taskID is a ULID (alnum only), so the joined path cannot escape NoteDir.
+	name := fmt.Sprintf("note-%s-step%d.md", taskID, s.No)
+	if err := os.MkdirAll(h.NoteDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(h.NoteDir, name)
+	body := fmt.Sprintf("---\ntask: %s\nstep: %d\nat: %s\n---\n%s\n", taskID, s.No, clock.Now(), strings.TrimSpace(payloadText(s)))
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return "", err
+	}
+	back, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if string(back) != body {
+		return "", fmt.Errorf("回读内容与写入不一致")
+	}
+	return filepath.ToSlash(path), nil
+}
+
+func payloadText(s PlanStep) string {
+	if t, ok := s.Payload.(string); ok {
+		return t
+	}
+	return fmt.Sprint(s.Payload)
+}
+
+func (h *Hub) executePlan(ctx context.Context, taskID string, plan Plan) []stepResult {
 	out := make([]stepResult, len(plan.Steps))
 	for i, s := range plan.Steps {
-		out[i] = stepResult{OK: true, Message: "完成：" + s.Action, Ref: "local:" + s.Tool}
-		if s.Tool == "form.submit" {
-			out[i].Message = "模拟提交已记录（V0 未连接真实站点）"
-		}
+		out[i] = h.runStep(ctx, taskID, plan, s)
 	}
 	return out
 }
@@ -371,16 +509,18 @@ func parseIntent(text string) Plan {
 	t := strings.TrimSpace(text)
 	low := strings.ToLower(t)
 	switch {
-	case strings.Contains(t, "每天") || strings.Contains(t, "定时") || strings.Contains(low, "cron") || strings.Contains(t, "预约"):
+	case strings.Contains(t, "每天") || strings.Contains(t, "每周") || strings.Contains(t, "星期") || strings.Contains(t, "工作日") || strings.Contains(t, "定时") || strings.Contains(low, "cron") || strings.Contains(t, "预约"):
+		hint, _ := cronHintFromText(t)
 		return Plan{
 			Title: "预约：" + truncate(t, 24), Kind: "schedule", ConfirmLevel: "L2",
-			Summary: "将按你的口述创建一条预约（仅陈述已安排，不暗示执行必将成功）。漏触发默认 skip_missed，预算未启用。",
-			Steps:   []PlanStep{{No: 1, Tool: "schedule.create", Action: "创建预约定义", Level: "L2", Payload: t}},
+			Summary:  "将按你的口述创建一条预约（仅陈述已安排，不暗示执行必将成功）。漏触发默认 skip_missed，预算未启用。",
+			CronHint: hint,
+			Steps:    []PlanStep{{No: 1, Tool: "schedule.create", Action: "创建预约定义", Level: "L2", Payload: t}},
 		}
 	case strings.Contains(t, "提交") || strings.Contains(t, "发送") || strings.Contains(t, "发布"):
 		return Plan{
 			Title: "对外提交", Kind: "task", ConfirmLevel: "L3",
-			Summary: "这是对外提交类操作，需要输入式确认后才会执行。",
+			Summary: "对外提交类操作：先预填预览，再提交表单。",
 			Steps: []PlanStep{
 				{No: 1, Tool: "form.preview", Action: "预填表单", Level: "L2", Payload: t},
 				{No: 2, Tool: "form.submit", Action: "提交表单", Level: "L3", Payload: t},
@@ -389,7 +529,7 @@ func parseIntent(text string) Plan {
 	case strings.Contains(t, "表单") || strings.Contains(t, "填写") || strings.Contains(t, "代填"):
 		return Plan{
 			Title: "表单预填", Kind: "task", ConfirmLevel: "L2",
-			Summary: "读取并预填表单，提交前仍会再向你确认。",
+			Summary: "读取并预填表单，不提交。",
 			Steps:   []PlanStep{{No: 1, Tool: "form.preview", Action: "预填预览", Level: "L2", Payload: t}},
 		}
 	case strings.Contains(t, "记下") || strings.Contains(t, "备忘") || strings.Contains(t, "笔记"):
@@ -405,6 +545,117 @@ func parseIntent(text string) Plan {
 			Steps:   []PlanStep{{No: 1, Tool: "answer.query", Action: "回答", Level: "L0", Payload: t}},
 		}
 	}
+}
+
+// cronHintFromText maps a spoken schedule hint to the five-field expression
+// stored in workflow.schedule_cron. It never invents a fire time: an utterance
+// without a recognisable clock time returns ("", false) and the caller keeps the
+// documented V0 default. An explicit "cron <expr>" wins when it parses.
+func cronHintFromText(text string) (string, bool) {
+	low := strings.ToLower(text)
+	if i := strings.Index(low, "cron"); i >= 0 {
+		fields := strings.Fields(text[i+len("cron"):])
+		if len(fields) >= 5 {
+			candidate := strings.Join(fields[:5], " ")
+			if _, err := cron.Parse(candidate); err == nil {
+				return candidate, true
+			}
+		}
+	}
+	hour, minute, ok := parseSpokenClock(text)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%d %d * * %s", minute, hour, spokenWeekday(text)), true
+}
+
+var clockRe = regexp.MustCompile(`([0-9]{1,2}|[零〇一二两三四五六七八九十]+)\s*[点时](?:\s*([0-9]{1,2})\s*分|(半))?`)
+
+func parseSpokenClock(text string) (hour, minute int, ok bool) {
+	m := clockRe.FindStringSubmatch(text)
+	if m == nil {
+		return 0, 0, false
+	}
+	h, ok := spokenNumber(m[1])
+	if !ok || h < 0 || h > 23 {
+		return 0, 0, false
+	}
+	if m[3] == "半" {
+		minute = 30
+	} else if m[2] != "" {
+		n, err := strconv.Atoi(m[2])
+		if err != nil || n < 0 || n > 59 {
+			return 0, 0, false
+		}
+		minute = n
+	}
+	if (strings.Contains(text, "下午") || strings.Contains(text, "晚上") || strings.Contains(text, "傍晚")) && h < 12 {
+		h += 12
+	}
+	if strings.Contains(text, "中午") && h < 12 {
+		h = 12
+	}
+	return h, minute, true
+}
+
+// spokenNumber accepts Arabic digits and the small Chinese numerals V0 needs
+// for clock hours: 0-10, 十N, N十 and N十M.
+func spokenNumber(s string) (int, bool) {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n, true
+	}
+	d := map[rune]int{'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+	r := []rune(s)
+	switch len(r) {
+	case 1:
+		if r[0] == '十' {
+			return 10, true
+		}
+		if v, ok := d[r[0]]; ok {
+			return v, true
+		}
+	case 2:
+		if r[0] == '十' {
+			if v, ok := d[r[1]]; ok {
+				return 10 + v, true
+			}
+		}
+		if r[1] == '十' {
+			if v, ok := d[r[0]]; ok {
+				return v * 10, true
+			}
+		}
+	case 3:
+		if r[1] == '十' {
+			a, ok1 := d[r[0]]
+			b, ok2 := d[r[2]]
+			if ok1 && ok2 {
+				return a*10 + b, true
+			}
+		}
+	}
+	return 0, false
+}
+
+var spokenWeekdays = []struct {
+	name string
+	expr string
+}{
+	{"一", "1"}, {"二", "2"}, {"三", "3"}, {"四", "4"}, {"五", "5"}, {"六", "6"}, {"日", "0"}, {"天", "0"},
+}
+
+func spokenWeekday(text string) string {
+	if strings.Contains(text, "工作日") {
+		return "1-5"
+	}
+	for _, w := range spokenWeekdays {
+		for _, prefix := range []string{"周", "星期", "礼拜"} {
+			if strings.Contains(text, prefix+w.name) {
+				return w.expr
+			}
+		}
+	}
+	return "*"
 }
 
 func mockAnswer(q string) string {
@@ -439,6 +690,137 @@ func (h *Hub) ListTasks(ctx context.Context) ([]TaskView, error) {
 		v.Plan = json.RawMessage(plan)
 		out = append(out, v)
 	}
+	err = rows.Err()
+	// MaxOpenConns(1): the cursor must be released before the path query runs.
+	_ = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(out))
+	for i, v := range out {
+		ids[i] = v.ID
+	}
+	paths, err := h.pathsFor(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Path = paths[out[i].ID]
+	}
+	return out, nil
+}
+
+type StepEvidence struct {
+	StepNo           int    `json:"stepNo"`
+	RevisionNo       int    `json:"revisionNo"`
+	Tool             string `json:"tool"`
+	EvidenceKind     string `json:"evidenceKind"`
+	ExecutionOutcome string `json:"executionOutcome"`
+	SideEffectStatus string `json:"sideEffectStatus"`
+	Uncertainty      string `json:"uncertaintyStatus"`
+	ResultRef        string `json:"resultRef,omitempty"`
+	IntentEventID    string `json:"intentEventId"`
+	IntentAt         string `json:"intentAt"`
+	ResultEventID    string `json:"resultEventId,omitempty"`
+	ResultAt         string `json:"resultAt,omitempty"`
+	StartedAt        string `json:"startedAt,omitempty"`
+	EndedAt          string `json:"endedAt,omitempty"`
+}
+
+type TaskDetail struct {
+	TaskView
+	States []string       `json:"states"`
+	Steps  []StepEvidence `json:"steps"`
+}
+
+// Detail is the evidence replay the owner signs off on: the canonical 13 states,
+// the statuses task_event actually recorded, and one row per step at its current
+// revision. A stage never appears in path unless an event put it there.
+func (h *Hub) Detail(ctx context.Context, taskID string) (*TaskDetail, error) {
+	v, err := h.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	d := &TaskDetail{TaskView: *v}
+	for _, s := range taskfsm.Sequence() {
+		d.States = append(d.States, string(s))
+	}
+	paths, err := h.pathsFor(ctx, []string{taskID})
+	if err != nil {
+		return nil, err
+	}
+	d.Path = paths[taskID]
+	d.Steps, err = h.currentSteps(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// pathsFor returns the chronological, de-duplicated status path per task.
+func (h *Hub) pathsFor(ctx context.Context, taskIDs []string) (map[string][]string, error) {
+	want := make(map[string]bool, len(taskIDs))
+	for _, tid := range taskIDs {
+		want[tid] = true
+	}
+	rows, err := h.Store.Query(ctx, `SELECT task_id, to_status FROM task_event WHERE to_status IS NOT NULL ORDER BY task_id, seq`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var tid, s string
+		if err := rows.Scan(&tid, &s); err != nil {
+			return nil, err
+		}
+		if !want[tid] || seen[tid+"|"+s] {
+			continue
+		}
+		seen[tid+"|"+s] = true
+		out[tid] = append(out[tid], s)
+	}
+	return out, rows.Err()
+}
+
+// currentSteps resolves "current" as MAX(revision_no); the baseline has no
+// is_current column and we must not invent one.
+func (h *Hub) currentSteps(ctx context.Context, taskID string) ([]StepEvidence, error) {
+	rows, err := h.Store.Query(ctx, `
+		SELECT r.step_no, r.revision_no, t.name, r.evidence_kind, r.execution_outcome,
+		       r.side_effect_status, r.uncertainty_status, r.result_ref,
+		       r.intent_event_id, ie.created_at, r.result_event_id, re.created_at,
+		       r.started_at, r.ended_at
+		FROM task_step_result r
+		JOIN tool t ON t.id = r.tool_id
+		JOIN task_event ie ON ie.id = r.intent_event_id
+		LEFT JOIN task_event re ON re.id = r.result_event_id
+		WHERE r.task_id=? AND r.revision_no=(
+			SELECT MAX(revision_no) FROM task_step_result
+			WHERE task_id=r.task_id AND step_no=r.step_no)
+		ORDER BY r.step_no`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []StepEvidence{}
+	for rows.Next() {
+		var s StepEvidence
+		var ref, resultID, resultAt, started, ended sql.NullString
+		if err := rows.Scan(&s.StepNo, &s.RevisionNo, &s.Tool, &s.EvidenceKind, &s.ExecutionOutcome,
+			&s.SideEffectStatus, &s.Uncertainty, &ref,
+			&s.IntentEventID, &s.IntentAt, &resultID, &resultAt,
+			&started, &ended); err != nil {
+			return nil, err
+		}
+		s.ResultRef = ref.String
+		s.ResultEventID = resultID.String
+		s.ResultAt = resultAt.String
+		s.StartedAt = started.String
+		s.EndedAt = ended.String
+		out = append(out, s)
+	}
 	return out, rows.Err()
 }
 
@@ -472,18 +854,38 @@ func (h *Hub) ListEvents(ctx context.Context, taskID string) ([]map[string]any, 
 }
 
 func (h *Hub) PendingApprovals(ctx context.Context) ([]map[string]any, error) {
+	type row struct {
+		id, taskID, lvl, scope, exp string
+	}
 	rows, err := h.Store.Query(ctx, `SELECT id,task_id,confirm_level,scope_snapshot,expires_at FROM approval_request WHERE decision IS NULL ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []map[string]any
+	var pending []row
 	for rows.Next() {
-		var id, tid, lvl, scope, exp string
-		if err := rows.Scan(&id, &tid, &lvl, &scope, &exp); err != nil {
+		var r row
+		if err := rows.Scan(&r.id, &r.taskID, &r.lvl, &r.scope, &r.exp); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id, "taskId": tid, "level": lvl, "scope": json.RawMessage(scope), "expiresAt": exp})
+		pending = append(pending, r)
+	}
+	err = rows.Err()
+	// MaxOpenConns(1): release the cursor before counting decisions per task.
+	_ = rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	out := []map[string]any{}
+	for _, r := range pending {
+		n, err := h.approvedCount(ctx, r.taskID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"id": r.id, "taskId": r.taskID, "level": r.lvl,
+			"scope": json.RawMessage(r.scope), "expiresAt": r.exp, "round": n + 1,
+		})
 	}
 	return out, nil
 }
@@ -491,9 +893,12 @@ func (h *Hub) PendingApprovals(ctx context.Context) ([]map[string]any, error) {
 func (h *Hub) Health(ctx context.Context) map[string]any {
 	var tools int
 	_ = h.Store.QueryRow(ctx, `SELECT COUNT(*) FROM tool`).Scan(&tools)
+	// V0 keeps the one UI phrase here rather than adding a config endpoint:
+	// health is already fetched on boot, so the client has a single source.
 	return map[string]any{
 		"ok": true, "writer": "single-process", "tools": tools,
 		"budget": "UNSET", "schedulerSemantics": "skip_missed (U13 default, not owner-ratified)",
+		"l3ConfirmPhrase": h.l3Phrase(),
 	}
 }
 
