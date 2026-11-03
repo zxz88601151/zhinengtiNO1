@@ -1,0 +1,25 @@
+# V0 runtime config. Numeric policy values stay UNSET until owner provides them.
+deployment:
+  mode: single-process
+  addr: 127.0.0.1:8080
+
+auth:
+  local_owner: true
+
+models:
+  llm: mock
+  stt: browser-web-speech
+  tts: browser-speech-synthesis
+
+scheduler:
+  catchup_mode: skip_missed   # U13 not ratified
+  tick_seconds: 15
+  budget: UNSET               # U19 / U39 — do not enforce
+
+ui:
+  hybrid: conversation-left-execution-right
+  effects: session+task+notice
+
+task_policy:
+  interrupted_timeout: UNSET
+  unknown_resolution_max_attempts: UNSET
