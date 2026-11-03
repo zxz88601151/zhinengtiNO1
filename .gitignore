@@ -1,4 +1,14 @@
+# Runtime data and local backups (contain real SQLite data; never commit)
 data/
+data_backup_*/
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend dependencies and build output
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
+
+# Binaries
 *.exe
